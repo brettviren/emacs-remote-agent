@@ -1,7 +1,8 @@
 [package]
 name = "ERA"
-version = "0.5"
+version = "0.5.0"
 edition = "2026"
+rust-version = "1.64"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -11,3 +12,4 @@ anyhow = "1.0"
 base64 = "0.21"
 hostname = "0.3"
 dirs = "5"
+
