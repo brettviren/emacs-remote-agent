@@ -17,6 +17,7 @@
 (require 'base64)
 (require 'seq)
 (require 'tramp)
+(require 'autorevert)
 
 
 ;; Removed -q to prevent breaking your SSH ProxyCommand.
@@ -165,6 +166,23 @@
            when (eq (ra-connection-process conn) proc)
            return conn))
 
+(defun ra--process-sentinel (proc event)
+  "Handle PROC state changes (EVENT), tearing down its connection on exit."
+  (unless (process-live-p proc)
+    (let ((conn (ra--find-connection-by-proc proc)))
+      (when conn
+        (message "[RA] Connection to %s closed: %s" (ra-connection-host conn) (string-trim event))
+        (maphash (lambda (_id req)
+                   (let ((error-cb (plist-get req :error-callback)))
+                     (when error-cb
+                       (funcall error-cb (format "Connection closed: %s" (string-trim event))))))
+                 (ra-connection-pending-requests conn))
+        (clrhash (ra-connection-pending-requests conn))
+        (let (stale-keys)
+          (maphash (lambda (key c) (when (eq c conn) (push key stale-keys)))
+                    ra--connections)
+          (dolist (key stale-keys) (remhash key ra--connections)))))))
+
 (defun ra--process-handshake (conn)
   "Parse initial handshake, robustly ignoring SSH banner/debug noise."
   (let ((buf (ra-connection-buffer conn)))
@@ -205,8 +223,9 @@
 
 (defun ra--process-messages (conn)
   "Process length-prefixed RPC messages."
-  (let ((buf (ra-connection-buffer conn)))
-    (while (>= (length buf) 4)
+  (let ((buf (ra-connection-buffer conn))
+        (continue t))
+    (while (and continue (>= (length buf) 4))
       (let* ((len-bytes (substring buf 0 4))
              (len (+ (lsh (aref len-bytes 0) 24)
                      (lsh (aref len-bytes 1) 16)
@@ -214,7 +233,7 @@
                      (aref len-bytes 3))))
 
         (if (< (length buf) (+ 4 len))
-            (return) ; Wait for more data
+            (setq continue nil) ; Wait for more data
           (let ((msg (substring buf 4 (+ 4 len))))
             (setf (ra-connection-buffer conn) (substring buf (+ 4 len)))
             (condition-case err
@@ -223,8 +242,8 @@
             (setq buf (ra-connection-buffer conn))))))))
 
 (defun ra--dispatch-response (conn response)
-  (let ((id (alist-get 'id response))
-        (req (gethash id (ra-connection-pending-requests conn))))
+  (let* ((id (alist-get 'id response))
+         (req (gethash id (ra-connection-pending-requests conn))))
     (when req
       (remhash id (ra-connection-pending-requests conn))
       (let ((callback (plist-get req :callback))
@@ -396,6 +415,20 @@
 
 ;; --- Helpers & Patches ------------------------------------------------------
 
+(defun ra--with-connection (host callback)
+  "Get or establish a connection to HOST, block until its handshake completes, then call CALLBACK with the connection."
+  (let ((conn (ra--get-connection host)))
+    (let ((c 0))
+      (while (and (not (ra-connection-handshake-received conn))
+                  (< c (* ra-agent-timeout 10)))
+        (unless (process-live-p (ra-connection-process conn))
+          (signal 'file-error (list "Connection failed" host)))
+        (accept-process-output (ra-connection-process conn) 0.1)
+        (setq c (1+ c))))
+    (unless (ra-connection-handshake-received conn)
+      (signal 'file-error (list "Handshake timeout" host)))
+    (funcall callback conn)))
+
 (defun ra--sync-request (conn method params)
   "Blocking request wrapper."
   (let ((result nil) (error nil) (done nil))
@@ -512,10 +545,10 @@
                                                   (conn (ra--get-connection host))
                                                   (stat (ra--sync-request conn "stat" `((path . ,(nth 2 parsed)))))
                                                   (new-mtime (seconds-to-time (alist-get 'mtime stat))))
-                                             (unless (equal new-mtime (buffer-modified-timestamp))
-                                               (auto-revert-handler t)))
-                                         (error nil)))) buffer)))
-      (set-buffer-modified-timestamp nil)
+                                             (unless (equal new-mtime (visited-file-modtime))
+                                               (auto-revert-handler)))
+                                         (error nil)))) buffer))))
+      (with-current-buffer buffer (set-visited-file-modtime nil))
       (puthash buffer timer ra--auto-revert-timers))))
 
 (advice-add 'ra-file-handler :after
@@ -545,6 +578,5 @@
   (ra--register-handler))
 
 (provide 'remote-agent)
-)
 
 ;;; remote-agent.el ends here
